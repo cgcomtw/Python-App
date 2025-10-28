@@ -1,0 +1,251 @@
+# -*- coding: utf-8 -*-
+# slide_show.py
+# 多圖片幻燈片展示（PySide6）
+
+import os
+import re
+import sys
+from PySide6.QtCore import (
+    Qt, QTimer, QEasingCurve, QCoreApplication, QFileInfo
+)
+from PySide6.QtGui import QPixmap, QAction
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QLabel, QVBoxLayout, QFileDialog,
+    QMessageBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout
+)
+from PySide6.QtWidgets import QGraphicsOpacityEffect
+from PySide6.QtCore import QPropertyAnimation, QAbstractAnimation
+
+SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png'}
+
+# 固定的還原尺寸（邏輯像素）
+RESTORE_W, RESTORE_H = 1280, 720
+
+
+def is_supported_image(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in SUPPORTED_EXTS
+
+
+def natural_sort_key(s: str):
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(r'(\d+)', s)]
+
+
+class DurationDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("設定")
+        self.setModal(True)
+
+        self.displaySpin = QDoubleSpinBox(self)
+        self.displaySpin.setRange(0.1, 3600.0)
+        self.displaySpin.setDecimals(1)
+        self.displaySpin.setValue(3.0)
+
+        self.fadeSpin = QDoubleSpinBox(self)
+        self.fadeSpin.setRange(0.0, 60.0)
+        self.fadeSpin.setDecimals(2)
+        self.fadeSpin.setValue(1.0)
+
+        form = QFormLayout()
+        form.addRow("每張展示時間（秒）", self.displaySpin)
+        form.addRow("轉場淡入時間（秒）", self.fadeSpin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return self.displaySpin.value(), self.fadeSpin.value()
+
+
+class ImageView(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setScaledContents(False)
+        self._pix = None
+        self.setStyleSheet("background:#000;")
+
+    def setImage(self, pix: QPixmap):
+        self._pix = pix
+        self._rescale()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self):
+        if self._pix is None or self.width() <= 0 or self.height() <= 0:
+            self.clear()
+            return
+        scaled = self._pix.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.setPixmap(scaled)
+
+
+class SmoothSlideWindow(QWidget):
+    def __init__(self, images, display_sec: float, fade_sec: float, parent=None):
+        super().__init__(parent)
+        self.images = images
+        self.display_ms = int(display_sec * 1000)
+        self.fade_ms = int(fade_sec * 1000)
+        self.index = -1
+        self.paused = False
+        self._is_fullscreen = False
+
+        self.imageLabel = ImageView(self)
+
+        base = QVBoxLayout()
+        base.setContentsMargins(0, 0, 0, 0)
+        base.setSpacing(0)
+        base.addWidget(self.imageLabel, 1)
+        self.setLayout(base)
+
+        self.opacity_effect = QGraphicsOpacityEffect(self.imageLabel)
+        self.imageLabel.setGraphicsEffect(self.opacity_effect)
+        self.fade_anim = QPropertyAnimation(self.opacity_effect, b"opacity", self)
+        self.fade_anim.setEasingCurve(QEasingCurve.InOutQuad)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.nextImage)
+
+        self._install_actions()
+
+        self.setWindowTitle("slide_show")
+        self.resize(RESTORE_W, RESTORE_H)  # 預設 1280×720
+
+        self.nextImage(starting=True)
+
+    def _install_actions(self):
+        act_full = QAction(self)
+        act_full.setShortcut(Qt.Key_F11)
+        act_full.triggered.connect(self.toggle_fullscreen)
+        self.addAction(act_full)
+
+        act_pause = QAction(self)
+        act_pause.setShortcut(Qt.Key_Space)
+        act_pause.triggered.connect(self.toggle_pause)
+        self.addAction(act_pause)
+
+        act_esc = QAction(self)
+        act_esc.setShortcut(Qt.Key_Escape)
+        act_esc.triggered.connect(QCoreApplication.instance().quit)
+        self.addAction(act_esc)
+
+    def toggle_fullscreen(self):
+        if not self._is_fullscreen:
+            self.showFullScreen()        # 全螢幕（無標題列）
+            self._is_fullscreen = True
+        else:
+            # 還原為正常視窗，並在下一個事件循環「確定」應用 1280×720
+            self.showNormal()
+            def apply_restore_size():
+                self.resize(RESTORE_W, RESTORE_H)
+                # 置中到目前螢幕
+                scr = self.screen() or QApplication.primaryScreen()
+                if scr:
+                    geo = scr.availableGeometry()
+                    x = geo.x() + (geo.width() - RESTORE_W) // 2
+                    y = geo.y() + (geo.height() - RESTORE_H) // 2
+                    self.move(x, y)
+            QTimer.singleShot(0, apply_restore_size)
+            self._is_fullscreen = False
+
+    def toggle_pause(self):
+        if self.paused:
+            self.paused = False
+            self._arm_timer()
+        else:
+            self.paused = True
+            self.timer.stop()
+
+    def _update_title(self, path: str, pix: QPixmap):
+        fi = QFileInfo(path)
+        file_name = fi.fileName()  # 確保中文檔名正確
+        w, h = pix.width(), pix.height()
+        self.setWindowTitle(f"{file_name} - {w}×{h}")
+
+    def nextImage(self, starting=False):
+        if not self.images:
+            return
+        self.index = (self.index + 1) % len(self.images)
+        path = self.images[self.index]
+        pix = QPixmap(path)
+        if pix.isNull():
+            self.nextImage()
+            return
+
+        self.imageLabel.setImage(pix)
+        self._update_title(path, pix)
+
+        self.fade_anim.stop()
+        self.opacity_effect.setOpacity(0.0)
+        self.fade_anim.setStartValue(0.0)
+        self.fade_anim.setEndValue(1.0)
+        self.fade_anim.setDuration(max(0, self.fade_ms))
+        self.fade_anim.start(QAbstractAnimation.KeepWhenStopped)
+
+        if not self.paused:
+            self._arm_timer()
+
+    def _arm_timer(self):
+        self.timer.stop()
+        self.timer.start(max(1, self.display_ms))
+
+
+def pick_one_image_and_collect():
+    dlg = QFileDialog()
+    dlg.setFileMode(QFileDialog.ExistingFile)
+    dlg.setNameFilter("Images (*.jpg *.jpeg *.png)")
+    dlg.setViewMode(QFileDialog.Detail)
+
+    if dlg.exec() != QDialog.Accepted:
+        return None, []
+
+    selected = dlg.selectedFiles()[0]
+    if not is_supported_image(selected):
+        QMessageBox.warning(None, "格式不支援", "請選擇 JPG 或 PNG 檔案。")
+        return None, []
+
+    folder = os.path.dirname(selected)
+    files = []
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and is_supported_image(path):
+            files.append(path)
+
+    files.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
+    return selected, files
+
+
+def main():
+    app = QApplication(sys.argv)
+
+    dur_dlg = DurationDialog()
+    if dur_dlg.exec() != QDialog.Accepted:
+        return
+    display_sec, fade_sec = dur_dlg.values()
+
+    selected, images = pick_one_image_and_collect()
+    if not images:
+        return
+
+    images.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
+    try:
+        start_idx = images.index(selected)
+        images = images[start_idx:] + images[:start_idx]
+    except ValueError:
+        pass
+
+    win = SmoothSlideWindow(images, display_sec, fade_sec)
+    win.show()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
