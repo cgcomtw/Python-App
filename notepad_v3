@@ -1,0 +1,297 @@
+# notepad.py
+# Python 3.x + Tkinter 記事本（暗黑/淺色主題切換、字體可調、Ctrl +/-/0）
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import tkinter.font as tkfont
+
+APP_NAME = "記事本"
+
+DARK_THEME = {
+    "bg": "#1e1e1e",
+    "fg": "#d4d4d4",
+    "insertbg": "#ffffff",
+    "selectbg": "#264f78",
+    "selectfg": "#ffffff",
+    "menu_bg": "#333333",
+    "menu_fg": "#d4d4d4",
+    "active_bg": "#444444",
+    "active_fg": "#ffffff"
+}
+LIGHT_THEME = {
+    "bg": "#ffffff",
+    "fg": "#000000",
+    "insertbg": "#000000",
+    "selectbg": "#cce8ff",
+    "selectfg": "#000000",
+    "menu_bg": "#f0f0f0",
+    "menu_fg": "#000000",
+    "active_bg": "#e0e0e0",
+    "active_fg": "#000000"
+}
+
+def _default_zh_font():
+    if os.name == "nt":
+        return "Microsoft JhengHei UI"
+    return "PingFang TC"
+
+# 預設字型與大小（依需求）
+DEFAULT_FONT_FAMILY = _default_zh_font()
+DEFAULT_FONT_FALLBACK = "Microsoft JhengHei"
+DEFAULT_FONT_SIZE = 15
+
+class SimpleNotepad:
+    def __init__(self, root):
+        self.root = root
+        self.current_file = None
+        self.dirty = False
+
+        # 視窗設定
+        self.root.title(f"未命名 - {APP_NAME}")
+        self.root.geometry("900x650")
+
+        # 主題（預設暗黑）
+        self.theme_is_dark = True
+        self.theme_var = tk.StringVar(value="dark")
+
+        # 字型（如主要字型不存在則自動退回）
+        try:
+            self.text_font = tkfont.Font(family=DEFAULT_FONT_FAMILY, size=DEFAULT_FONT_SIZE)
+        except tk.TclError:
+            self.text_font = tkfont.Font(family=(DEFAULT_FONT_FALLBACK if os.name == "nt" else "Menlo"), size=DEFAULT_FONT_SIZE)
+
+        # 編輯區 + 捲軸
+        self.text = tk.Text(root, undo=True, wrap="word", font=self.text_font, tabs=("2c"),
+                            padx=5, pady=5, highlightthickness=0, relief="flat", bd=0)
+        self.text.pack(fill="both", expand=True, side="left")
+        self.yscroll = tk.Scrollbar(root, command=self.text.yview)
+        self.yscroll.pack(fill="y", side="right")
+        self.text.configure(yscrollcommand=self.yscroll.set)
+
+        # 套用主題
+        self.apply_theme()
+
+        # 監聽變動
+        self.text.bind("<<Modified>>", self._on_text_modified)
+
+        # 功能表
+        menubar = tk.Menu(root)
+
+        # 檔案
+        filemenu = tk.Menu(menubar, tearoff=0)
+        filemenu.add_command(label="新增 (Ctrl+N)", command=self.new_file)
+        filemenu.add_command(label="開啟… (Ctrl+O)", command=self.open_file)
+        filemenu.add_separator()
+        filemenu.add_command(label="儲存 (Ctrl+S)", command=self.save_file)
+        filemenu.add_command(label="另存新檔… (Ctrl+Shift+S)", command=self.save_as)
+        filemenu.add_separator()
+        filemenu.add_command(label="離開 (Ctrl+Q)", command=self.on_exit)
+        menubar.add_cascade(label="檔案", menu=filemenu)
+
+        # 編輯
+        editmenu = tk.Menu(menubar, tearoff=0)
+        editmenu.add_command(label="復原 (Ctrl+Z)", command=lambda: self.text.event_generate("<<Undo>>"))
+        editmenu.add_command(label="取消復原 (Ctrl+Y)", command=lambda: self.text.event_generate("<<Redo>>"))
+        editmenu.add_separator()
+        editmenu.add_command(label="剪下 (Ctrl+X)", command=lambda: self.text.event_generate("<<Cut>>"))
+        editmenu.add_command(label="複製 (Ctrl+C)", command=lambda: self.text.event_generate("<<Copy>>"))
+        editmenu.add_command(label="貼上 (Ctrl+V)", command=lambda: self.text.event_generate("<<Paste>>"))
+        editmenu.add_separator()
+        editmenu.add_command(label="全選 (Ctrl+A)", command=self.select_all)
+        menubar.add_cascade(label="編輯", menu=editmenu)
+
+        # 檢視
+        viewmenu = tk.Menu(menubar, tearoff=0)
+        self.word_wrap = tk.BooleanVar(value=True)
+        viewmenu.add_checkbutton(label="自動換行", onvalue=True, offvalue=False,
+                                 variable=self.word_wrap, command=self.toggle_wrap)
+
+        # 主題（顯示：深色模式 / 淺色模式）
+        theme_menu = tk.Menu(viewmenu, tearoff=0)
+        theme_menu.add_radiobutton(
+            label="深色模式", value="dark", variable=self.theme_var,
+            command=lambda: self.set_theme(True)
+        )
+        theme_menu.add_radiobutton(
+            label="淺色模式", value="light", variable=self.theme_var,
+            command=lambda: self.set_theme(False)
+        )
+        viewmenu.add_cascade(label="主題", menu=theme_menu)
+
+        # 字體大小
+        font_menu = tk.Menu(viewmenu, tearoff=0)
+        font_menu.add_command(label="放大 (Ctrl +)", command=self.increase_font)
+        font_menu.add_command(label="縮小 (Ctrl -)", command=self.decrease_font)
+        font_menu.add_command(label="重設 (Ctrl 0)", command=self.reset_font)
+        viewmenu.add_cascade(label="字體大小", menu=font_menu)
+
+        menubar.add_cascade(label="檢視", menu=viewmenu)
+
+        # 說明
+        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label="關於", command=lambda: messagebox.showinfo("關於", "軟體開發 Kelvin Huang"))
+        menubar.add_cascade(label="說明", menu=helpmenu)
+
+        root.config(menu=menubar)
+
+        # 快捷鍵
+        root.bind("<Control-n>", lambda e: self.new_file())
+        root.bind("<Control-o>", lambda e: self.open_file())
+        root.bind("<Control-s>", lambda e: self.save_file())
+        root.bind("<Control-S>", lambda e: self.save_as())  # Shift+Ctrl+S
+        root.bind("<Control-q>", lambda e: self.on_exit())
+        root.bind("<Control-a>", lambda e: self.select_all())
+
+        # 字體大小快捷鍵
+        root.bind("<Control-plus>", self._inc_font_event)
+        root.bind("<Control-KP_Add>", self._inc_font_event)
+        root.bind("<Control-=>", self._inc_font_event)   # Ctrl + '=' 也視為放大
+        root.bind("<Control-minus>", self._dec_font_event)
+        root.bind("<Control-KP_Subtract>", self._dec_font_event)
+        root.bind("<Control-0>", self._reset_font_event)
+
+        # 快捷鍵：Ctrl + 滾輪改變字體大小
+        root.bind("<Control-MouseWheel>", self.on_ctrl_scroll)
+
+        # 關閉視窗攔截
+        root.protocol("WM_DELETE_WINDOW", self.on_exit)
+
+    # ===== 主題 =====
+    def apply_theme(self):
+        theme = DARK_THEME if self.theme_is_dark else LIGHT_THEME
+        self.root.configure(bg=theme["bg"])
+        self.text.configure(
+            bg=theme["bg"],
+            fg=theme["fg"],
+            insertbackground=theme["insertbg"],
+            selectbackground=theme["selectbg"],
+            selectforeground=theme["selectfg"],
+        )
+        self.root.option_add("*TButton*background", theme["menu_bg"])
+        self.root.option_add("*TButton*foreground", theme["menu_fg"])
+        self.root.option_add("*TButton*activeBackground", theme["active_bg"])
+        self.root.option_add("*TButton*activeForeground", theme["active_fg"])
+
+    def set_theme(self, dark: bool):
+        self.theme_is_dark = dark
+        self.theme_var.set("dark" if dark else "light")
+        self.apply_theme()
+
+    def on_ctrl_scroll(self, event):
+        if event.delta > 0:
+            self.increase_font(1)
+        else:
+            self.decrease_font(1)
+
+    # ===== 標題/狀態 =====
+    def update_title(self):
+        name = os.path.basename(self.current_file) if self.current_file else "未命名"
+        prefix = "* " if self.dirty else ""
+        self.root.title(f"{prefix}{name} - {APP_NAME}")
+
+    def _on_text_modified(self, _event=None):
+        self.text.edit_modified(False)
+        self.dirty = True
+        self.update_title()
+
+    # ===== 檔案 =====
+    def new_file(self):
+        if not self._maybe_save_changes():
+            return
+        self.text.delete("1.0", "end")
+        self.current_file = None
+        self.dirty = False
+        self.update_title()
+
+    def open_file(self):
+        if not self._maybe_save_changes():
+            return
+        path = filedialog.askopenfilename(
+            title="開啟檔案",
+            filetypes=[("文字檔案", "*.txt"), ("所有檔案", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            self.text.delete("1.0", "end")
+            self.text.insert("1.0", content)
+            self.current_file = path
+            self.dirty = False
+            self.text.edit_modified(False)
+            self.update_title()
+        except Exception as e:
+            messagebox.showerror("錯誤", f"無法開啟檔案：\n{e}")
+
+    def save_file(self):
+        if not self.current_file:
+            return self.save_as()
+        return self._write_to_path(self.current_file)
+
+    def save_as(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("文字檔案", "*.txt"), ("所有檔案", "*.*")],
+            title="另存新檔"
+        )
+        if not path:
+            return False
+        self.current_file = path
+        return self._write_to_path(path)
+
+    def _write_to_path(self, path) -> bool:
+        try:
+            text = self.text.get("1.0", "end-1c")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.dirty = False
+            self.text.edit_modified(False)
+            self.update_title()
+            return True
+        except Exception as e:
+            messagebox.showerror("錯誤", f"無法儲存檔案：\n{e}")
+            return False
+
+    # ===== 字體大小 =====
+    def increase_font(self, step: int = 2):
+        size = self.text_font.actual("size")
+        self.text_font.configure(size=min(size + step, 96))
+
+    def decrease_font(self, step: int = 2):
+        size = self.text_font.actual("size")
+        self.text_font.configure(size=max(size - step, 6))
+
+    def reset_font(self):
+        self.text_font.configure(size=DEFAULT_FONT_SIZE)
+
+    def _inc_font_event(self, event=None):
+        self.increase_font()
+        return "break"
+
+    def _dec_font_event(self, event=None):
+        self.decrease_font()
+        return "break"
+
+    def _reset_font_event(self, event=None):
+        self.reset_font()
+        return "break"
+
+    # 其他
+    def select_all(self):
+        self.text.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def toggle_wrap(self):
+        self.text.configure(wrap="word" if self.word_wrap.get() else "none")
+
+    def on_exit(self):
+        if not self._maybe_save_changes():
+            return
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SimpleNotepad(root)
+    root.mainloop()
